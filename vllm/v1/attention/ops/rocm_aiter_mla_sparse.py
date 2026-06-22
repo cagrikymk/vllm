@@ -182,6 +182,8 @@ def _cp_gather_indexer_quant_cache_kernel(
     safe_block_id = tl.where(valid_block, block_id, 0)
     safe_block_offset = tl.where(valid_block, block_offset, 0)
     tiled_block_offset = safe_block_offset % BLOCK_TILE_SIZE
+    # int64 to avoid int32 overflow of block_id * stride (packed per-block KV)
+    safe_block_id = safe_block_id.to(tl.int64)
     if LAYOUT == "SHUFFLE":
         src_cache_offset = (
             safe_block_id * kv_cache_stride
