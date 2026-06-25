@@ -8,11 +8,14 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -52,6 +55,10 @@ from vllm.model_executor.models.utils import (
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
+# DSv4: fuse the dense-MLP clamped-SwiGLU + fp8 quant and run the down-proj
+# through the AITER B-preshuffle GEMM (ROCm). Off by default.
+_USE_AITER_FUSED_MLP_PRESHUFFLE = envs.VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE
 
 
 class DeepseekV4MLP(nn.Module):
@@ -98,8 +105,58 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+        self.swiglu_limit = swiglu_limit
+        # Fused clamped-SwiGLU + fp8-quant -> B-preshuffle down-proj GEMM (ROCm,
+        # aiter). Filled at load by prepare_fused_act_quant; None -> eager
+        # act_fn + down_proj fallback.
+        self._fused_mlp = (
+            _USE_AITER_FUSED_MLP_PRESHUFFLE
+            and swiglu_limit is not None
+            and current_platform.is_rocm()
+            and rocm_aiter_ops.is_enabled()
+        )
+        self._fused_down_pre: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def prepare_fused_act_quant(self) -> None:
+        # Decode the down-proj block weight scale to fp32 (the fused act kernel
+        # emits an fp32 act scale; the a8w8 GEMM needs matching dtypes) and
+        # preshuffle a copy of the down-proj weight. down_proj.weight is left
+        # unshuffled for the eager fallback, so this must not be combined with a
+        # generic in-place weight preshuffle.
+        if not self._fused_mlp:
+            return
+        w = getattr(self.down_proj, "weight", None)
+        ws = getattr(self.down_proj, "weight_scale_inv", None)  # per-block scale
+        if w is None or ws is None or w.dim() != 2 or w.shape[-1] % 128 != 0:
+            return
+        if ws.dtype == torch.float8_e8m0fnu:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                _upcast_e8m0_to_fp32,
+            )
+
+            ws = _upcast_e8m0_to_fp32(ws).contiguous()
+        self._fused_down_pre = (
+            rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+            ws,
+        )
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fused_down_pre is not None and gate_up.dim() == 2:
+            assert self.swiglu_limit is not None
+            w_pre, w_scale = self._fused_down_pre
+            # Fused clamped-SwiGLU + fp8 quant (column-major scale) -> the
+            # B-preshuffle down-proj GEMM, replacing eager act_fn + down_proj.
+            x_fp8, x_scale = rocm_aiter_ops.fused_clamp_act_mul(
+                gate_up, self.swiglu_limit, group_size=128, transpose_scale=True
+            )
+            out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                x_fp8, w_pre, x_scale, w_scale, output_dtype=x.dtype
+            )
+            # down_proj is RowParallel; replicate its all-reduce (we bypass it).
+            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -815,6 +872,8 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         for module in self.modules():
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 module.prepare_attn_preshuffle()
+            elif isinstance(module, DeepseekV4MLP):
+                module.prepare_fused_act_quant()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

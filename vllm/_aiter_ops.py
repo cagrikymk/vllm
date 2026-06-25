@@ -1281,6 +1281,43 @@ def _rocm_aiter_group_fp8_quant_transpose_scale_fake(
     return x_fp8, out_bs
 
 
+def _rocm_aiter_fused_clamp_act_mul_impl(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+    # Fused clamped SwiGLU (gate=min(g,L), up=clamp(u,+-L), silu(gate)*up) +
+    # per-token group fp8 quant -> (x_fp8, x_scale) for the a8w8 block-scale GEMM.
+    # transpose_scale=True emits a column-major scale for the B-preshuffle GEMM.
+    return fused_clamp_act_mul(
+        x,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=FP8_DTYPE,
+        transpose_scale=transpose_scale,
+        quant_block_size=group_size,
+        scale_dtype_fmt="fp32",
+    )
+
+
+def _rocm_aiter_fused_clamp_act_mul_fake(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    assert N % 2 == 0
+    n_half = N // 2
+    num_blocks = (n_half + group_size - 1) // group_size
+    x_fp8 = torch.empty((M, n_half), dtype=FP8_DTYPE, device=x.device)
+    out_bs = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
+    return x_fp8, out_bs
+
+
 def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
     x: torch.Tensor,
     group_size: int,
@@ -1991,6 +2028,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_fused_clamp_act_mul",
+                op_func=_rocm_aiter_fused_clamp_act_mul_impl,
+                fake_impl=_rocm_aiter_fused_clamp_act_mul_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
                 op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
@@ -2256,6 +2299,17 @@ class rocm_aiter_ops:
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
             A, B, As, Bs, output_dtype
+        )
+
+    @staticmethod
+    def fused_clamp_act_mul(
+        x: torch.Tensor,
+        swiglu_limit: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_fused_clamp_act_mul(
+            x, swiglu_limit, group_size, transpose_scale
         )
 
     @staticmethod
