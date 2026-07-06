@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -272,6 +273,44 @@ def compute_global_topk_ragged_indices_and_indptr(
     return global_topk_ragged, topk_indptr, topk_lens
 
 
+def pack_global_topk_ragged_indices(
+    topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    topk_indptr: torch.Tensor,
+) -> torch.Tensor:
+    """Translate local topk indices to global paged slots, packed ragged per a
+    precomputed ``topk_indptr``.
+
+    Decode top-k lengths are position-determined
+    (``min((pos + 1) // compress_ratio, index_topk)``), so the indptr is built
+    once per step in the metadata builder; here only the data-dependent pack
+    kernel runs, recovering each token's length from the indptr delta.
+    """
+    topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
+    num_tokens = topk_indices.shape[0]
+    topk = topk_indices.shape[1]
+    global_topk_ragged = torch.empty(
+        num_tokens * topk, dtype=torch.int32, device=topk_indices.device
+    )
+    if global_topk_ragged.numel() > 0:
+        block = 128
+        _pack_global_topk_ragged_kernel[(num_tokens, triton.cdiv(topk, block))](
+            global_topk_ragged,
+            topk_indptr,
+            topk_indices,
+            topk_indices.stride(0),
+            token_to_req_indices,
+            block_table,
+            block_table.stride(0),
+            block_size,
+            topk,
+            BLOCK_SIZE=block,
+        )
+    return global_topk_ragged
+
+
 @triton.jit
 def _compute_combined_lens_kernel(
     combined_lens_ptr,
@@ -449,6 +488,10 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 
     c128a_decode_topk_ragged_indices: torch.Tensor | None = None
     c128a_decode_topk_ragged_indptr: torch.Tensor | None = None
+    # Ragged decode topk indptr for compress_ratio == 4. Lengths are
+    # position-determined so the indptr is precomputed here (per step) instead
+    # of on every layer; the ragged indices are packed per layer in decode.
+    c4a_decode_topk_ragged_indptr: torch.Tensor | None = None
 
 
 @dataclass
@@ -462,14 +505,21 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
         super().__init__(*args, **kwargs)
         self.c128a_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
         self.c128a_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
+        self.c4a_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
+        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         if self.compress_ratio == 128:
-            max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
             self.c128a_decode_topk_ragged_indices_buffer = torch.empty(
                 max_tokens * self.c128a_max_compressed,
                 dtype=torch.int32,
                 device=self.device,
             )
             self.c128a_decode_topk_ragged_indptr_buffer = torch.empty(
+                max_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        elif self.compress_ratio == 4:
+            self.c4a_decode_topk_ragged_indptr_buffer = torch.empty(
                 max_tokens + 1,
                 dtype=torch.int32,
                 device=self.device,
@@ -507,11 +557,45 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
                 self.c128a_max_compressed,
             )
 
+        c4a_indptr = None
+        if self.compress_ratio == 4:
+            c4a_indptr = self._build_c4a_decode_indptr(common_attn_metadata)
+
         return DeepseekV4ROCMAiterMLASparseMetadata(
             **vars(base),
             c128a_decode_topk_ragged_indices=ragged_indices,
             c128a_decode_topk_ragged_indptr=ragged_indptr,
+            c4a_decode_topk_ragged_indptr=c4a_indptr,
         )
+
+    def _build_c4a_decode_indptr(
+        self, cm: CommonAttentionMetadata
+    ) -> torch.Tensor | None:
+        """Ragged decode topk indptr for compress_ratio == 4.
+
+        Per-token length is ``min((pos + 1) // compress_ratio, index_topk)``,
+        matching the indexer's ``top_k_per_row_decode`` valid count
+        (``seq_lens // compress_ratio`` capped at ``index_topk``); padded tokens
+        (slot_mapping < 0) contribute 0. Written into a persistent buffer for
+        CUDA graph address stability.
+        """
+        num_decode_tokens = split_decodes_and_prefills(
+            cm, decode_threshold=self.reorder_batch_threshold or 1
+        )[2]
+        if num_decode_tokens == 0:
+            return None
+        assert cm.positions is not None
+        indptr_buf = self.c4a_decode_topk_ragged_indptr_buffer
+        assert indptr_buf is not None
+
+        nd = num_decode_tokens
+        pos = cm.positions[:nd]
+        valid = cm.slot_mapping[:nd] >= 0
+        lens = torch.clamp((pos + 1) // self.compress_ratio, max=self.topk_tokens)
+        lens = torch.where(valid, lens, torch.zeros_like(lens)).to(torch.int32)
+        indptr_buf[0] = 0
+        torch.cumsum(lens, dim=0, out=indptr_buf[1 : nd + 1])
+        return indptr_buf[: nd + 1]
 
 
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
@@ -692,21 +776,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         topk_ragged_indptr = None
         if not swa_only:
             assert attn_metadata is not None
-            assert swa_metadata.is_valid_token is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if self.compress_ratio == 4:
                 assert self.topk_indices_buffer is not None
-                (
-                    topk_ragged_indices,
-                    topk_ragged_indptr,
-                    topk_lens,
-                ) = compute_global_topk_ragged_indices_and_indptr(
+                assert attn_metadata.c4a_decode_topk_ragged_indptr is not None
+                topk_ragged_indptr = attn_metadata.c4a_decode_topk_ragged_indptr
+                topk_ragged_indices = pack_global_topk_ragged_indices(
                     self.topk_indices_buffer[:num_decode_tokens],
                     swa_metadata.token_to_req_indices,
                     attn_metadata.block_table[:num_decodes],
                     block_size,
-                    is_valid,
+                    topk_ragged_indptr,
                 )
             else:
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices

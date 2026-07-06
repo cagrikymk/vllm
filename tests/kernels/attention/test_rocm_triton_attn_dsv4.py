@@ -290,6 +290,70 @@ def test_compute_global_topk_ragged_indices_and_indptr() -> None:
 
 
 @torch.inference_mode()
+def test_pack_global_topk_ragged_matches_precomputed_indptr() -> None:
+    """The ratio-4 decode path precomputes the ragged indptr from positions
+    (``min((pos + 1) // compress_ratio, index_topk)``) instead of counting the
+    indexer output on every layer. Verify the precomputed indptr matches the
+    counted one and that packing with it reproduces the all-in-one path."""
+    from vllm.models.deepseek_v4.amd.rocm import (
+        compute_global_topk_ragged_indices_and_indptr,
+        pack_global_topk_ragged_indices,
+    )
+
+    device = torch.device("cuda")
+    block_size = 4
+    compress_ratio = 4
+    index_topk = 8
+    # Indexer contract: first min((pos + 1) // ratio, index_topk) entries valid,
+    # rest -1. Token 3 is padded (slot_mapping < 0) -> length 0.
+    positions = torch.tensor([3, 15, 63, 8], dtype=torch.int32, device=device)
+    slot_mapping = torch.tensor([0, 5, 9, -1], dtype=torch.int32, device=device)
+    topk_indices = torch.tensor(
+        [
+            [3, -1, -1, -1, -1, -1, -1, -1],
+            [0, 2, 4, 6, -1, -1, -1, -1],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, -1, -1, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    token_to_req_indices = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    block_table = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32, device=device
+    )
+    is_valid_token = slot_mapping >= 0
+
+    ref_ragged, ref_indptr, _ = compute_global_topk_ragged_indices_and_indptr(
+        topk_indices,
+        token_to_req_indices,
+        block_table,
+        block_size,
+        is_valid_token,
+    )
+
+    # Position-determined indptr, matching what the metadata builder precomputes.
+    lens = torch.clamp((positions + 1) // compress_ratio, max=index_topk)
+    lens = torch.where(is_valid_token, lens, torch.zeros_like(lens)).to(torch.int32)
+    precomputed_indptr = torch.zeros(
+        lens.shape[0] + 1, dtype=torch.int32, device=device
+    )
+    torch.cumsum(lens, dim=0, out=precomputed_indptr[1:])
+
+    actual_ragged = pack_global_topk_ragged_indices(
+        topk_indices,
+        token_to_req_indices,
+        block_table,
+        block_size,
+        precomputed_indptr,
+    )
+
+    total = int(ref_indptr[-1].item())
+    torch.testing.assert_close(precomputed_indptr, ref_indptr)
+    torch.testing.assert_close(actual_ragged[:total], ref_ragged[:total])
+
+
+@torch.inference_mode()
 def test_sparse_attn_prefill_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_prefill_ragged_triton,
