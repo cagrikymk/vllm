@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 
+from vllm.config import get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
@@ -569,6 +571,15 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
 
 
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLABackend):
+    # bf16 KV cache is opt-in via --kv-cache-dtype bfloat16 (plain-row layout);
+    # auto / fp8 / fp8_ds_mla keep the block-scaled fp8_ds_mla layout.
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8_ds_mla",
+        "fp8",
+    ]
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_FLASHMLA_SPARSE_DSV4"
@@ -582,6 +593,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
+
+    def _uses_fp8_ds_mla_layout(self) -> bool:
+        # bf16 KV cache (--kv-cache-dtype bfloat16) stores the main sparse-attn
+        # caches (compressed + SWA) as plain bf16 rows; auto / fp8 / fp8_ds_mla
+        # keep the block-scaled fp8_ds_mla (uint8) layout. The indexer cache is
+        # unaffected (always fp8).
+        return get_current_vllm_config().cache_config.cache_dtype != "bfloat16"
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

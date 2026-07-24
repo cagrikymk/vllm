@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -378,6 +379,25 @@ def paged_mqa_logits_module():
         except ImportError:
             return None
     return None
+
+
+@functools.lru_cache
+def _aiter_sparse_decode():
+    """aiter's gluon DSv4 sparse-MLA decode kernel (gfx950), or None if unavailable
+    or disabled via ``VLLM_DSV4_SPARSE_DECODE_AITER=0``. It is a drop-in for the
+    ragged split-K triton decode below (same packed fp8_ds_mla / bf16 layout, global
+    slots, per-head attn_sink) and ~1.1-1.9x faster; verified within fp8 tolerance.
+    """
+    if os.environ.get("VLLM_DSV4_SPARSE_DECODE_AITER", "1") == "0":
+        return None
+    if find_spec("aiter.ops.triton.attention.pa_decode_sparse") is None:
+        return None
+    try:
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+        return pa_decode_sparse
+    except ImportError:
+        return None
 
 
 def rocm_fp8_paged_mqa_logits(
@@ -1276,6 +1296,9 @@ def _sparse_attn_decode_ragged_kernel(
     # Compressed K-cache (extra): Triton encoder writes OCP everywhere.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    # fp8_ds_mla (uint8) cache vs plain bf16 rows (--kv-cache-dtype bfloat16).
+    MAIN_IS_FP8: tl.constexpr,
+    EXTRA_IS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1324,34 +1347,46 @@ def _sparse_attn_decode_ragged_kernel(
         block_idx = safe_slot // main_block_size
         pos_in_block = safe_slot % main_block_size
         cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data_ptr = cache_block_ptr + pos_in_block * 576
-        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
-
-        x_uint8 = tl.load(
-            token_data_ptr[:, None] + nope_offsets[None, :],
-            mask=valid[:, None] & nope_mask[None, :],
-            other=0,
-        )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+        if MAIN_IS_FP8:
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+            x_uint8 = tl.load(
+                token_data_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0,
+            )
+            if IS_FNUZ_MAIN:
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            encoded_scales = tl.load(
+                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                mask=valid[:, None] & nope_mask[None, :],
+                other=127,
+            )
+            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+            k_rope = tl.load(
+                rope_ptr[:, None] + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        encoded_scales = tl.load(
-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-            mask=valid[:, None] & nope_mask[None, :],
-            other=127,
-        )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            # Plain bf16 row: [nope | rope] = NOPE_DIM + ROPE_DIM contiguous.
+            row_ptr = cache_block_ptr + pos_in_block * (NOPE_DIM + ROPE_DIM)
+            k_nope = tl.load(
+                row_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0.0,
+            )
+            k_rope = tl.load(
+                row_ptr[:, None] + NOPE_DIM + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-        k_rope = tl.load(
-            rope_ptr[:, None] + rope_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1390,36 +1425,48 @@ def _sparse_attn_decode_ragged_kernel(
             cache_block_ptr = (
                 extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
             )
-            token_data_ptr = cache_block_ptr + pos_in_block * 576
-            token_scale_ptr = (
-                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
-            )
-
-            x_uint8 = tl.load(
-                token_data_ptr[:, None] + nope_offsets[None, :],
-                mask=valid[:, None] & nope_mask[None, :],
-                other=0,
-            )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            if EXTRA_IS_FP8:
+                token_data_ptr = cache_block_ptr + pos_in_block * 576
+                token_scale_ptr = (
+                    cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+                )
+                x_uint8 = tl.load(
+                    token_data_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0,
+                )
+                if IS_FNUZ_EXTRA:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                encoded_scales = tl.load(
+                    token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=127,
+                )
+                scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+                k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+                k_rope = tl.load(
+                    rope_ptr[:, None] + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
-            )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                # Plain bf16 row: [nope | rope] = NOPE_DIM + ROPE_DIM contiguous.
+                row_ptr = cache_block_ptr + pos_in_block * (NOPE_DIM + ROPE_DIM)
+                k_nope = tl.load(
+                    row_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0.0,
+                )
+                k_rope = tl.load(
+                    row_ptr[:, None] + NOPE_DIM + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-            k_rope = tl.load(
-                rope_ptr[:, None] + rope_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
             k_rope = tl.where(valid[:, None], k_rope, zero_rope)
             k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1517,6 +1564,9 @@ def _sparse_attn_decode_partial_kernel(
     # `IS_FNUZ` would decode one of them with the wrong FNUZ/OCP scale ratio.
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
+    # fp8_ds_mla (uint8) cache vs plain bf16 rows (--kv-cache-dtype bfloat16).
+    MAIN_IS_FP8: tl.constexpr,
+    EXTRA_IS_FP8: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
@@ -1574,34 +1624,46 @@ def _sparse_attn_decode_partial_kernel(
         block_idx = safe_slot // main_block_size
         pos_in_block = safe_slot % main_block_size
         cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data_ptr = cache_block_ptr + pos_in_block * 576
-        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
-
-        x_uint8 = tl.load(
-            token_data_ptr[:, None] + nope_offsets[None, :],
-            mask=valid[:, None] & nope_mask[None, :],
-            other=0,
-        )
-        if IS_FNUZ_MAIN:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+        if MAIN_IS_FP8:
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+            x_uint8 = tl.load(
+                token_data_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0,
+            )
+            if IS_FNUZ_MAIN:
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            encoded_scales = tl.load(
+                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                mask=valid[:, None] & nope_mask[None, :],
+                other=127,
+            )
+            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+            k_rope = tl.load(
+                rope_ptr[:, None] + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        encoded_scales = tl.load(
-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-            mask=valid[:, None] & nope_mask[None, :],
-            other=127,
-        )
-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            # Plain bf16 row: [nope | rope] = NOPE_DIM + ROPE_DIM contiguous.
+            row_ptr = cache_block_ptr + pos_in_block * (NOPE_DIM + ROPE_DIM)
+            k_nope = tl.load(
+                row_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0.0,
+            )
+            k_rope = tl.load(
+                row_ptr[:, None] + NOPE_DIM + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-        k_rope = tl.load(
-            rope_ptr[:, None] + rope_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1643,36 +1705,48 @@ def _sparse_attn_decode_partial_kernel(
             cache_block_ptr = (
                 extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
             )
-            token_data_ptr = cache_block_ptr + pos_in_block * 576
-            token_scale_ptr = (
-                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
-            )
-
-            x_uint8 = tl.load(
-                token_data_ptr[:, None] + nope_offsets[None, :],
-                mask=valid[:, None] & nope_mask[None, :],
-                other=0,
-            )
-            if IS_FNUZ_EXTRA:
-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            if EXTRA_IS_FP8:
+                token_data_ptr = cache_block_ptr + pos_in_block * 576
+                token_scale_ptr = (
+                    cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+                )
+                x_uint8 = tl.load(
+                    token_data_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0,
+                )
+                if IS_FNUZ_EXTRA:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                encoded_scales = tl.load(
+                    token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=127,
+                )
+                scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+                k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+                k_rope = tl.load(
+                    rope_ptr[:, None] + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            encoded_scales = tl.load(
-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
-                mask=valid[:, None] & nope_mask[None, :],
-                other=127,
-            )
-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+                # Plain bf16 row: [nope | rope] = NOPE_DIM + ROPE_DIM contiguous.
+                row_ptr = cache_block_ptr + pos_in_block * (NOPE_DIM + ROPE_DIM)
+                k_nope = tl.load(
+                    row_ptr[:, None] + nope_offsets[None, :],
+                    mask=valid[:, None] & nope_mask[None, :],
+                    other=0.0,
+                )
+                k_rope = tl.load(
+                    row_ptr[:, None] + NOPE_DIM + rope_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0.0,
+                )
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
-
-            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-            k_rope = tl.load(
-                rope_ptr[:, None] + rope_offsets[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            )
             k_rope = tl.where(valid[:, None], k_rope, zero_rope)
             k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -2096,6 +2170,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     nope_block = triton.next_power_of_2(nope_head_dim)
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
+    # fp8_ds_mla caches are packed uint8; bf16 caches store plain rows.
+    main_is_fp8 = main_cache.dtype == torch.uint8
+    extra_is_fp8 = extra_cache.dtype == torch.uint8
 
     if not _ON_GFX950:  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
@@ -2128,11 +2205,32 @@ def _rocm_sparse_attn_decode_ragged_triton(
             ROPE_DIM=rope_head_dim,
             IS_FNUZ_MAIN=is_fnuz,
             IS_FNUZ_EXTRA=False,
+            MAIN_IS_FP8=main_is_fp8,
+            EXTRA_IS_FP8=extra_is_fp8,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             num_warps=8,
         )
         return out
+
+    # gfx950: prefer aiter's gluon sparse-MLA decode -- a drop-in for the split-K
+    # triton baseline below, ~1.1-1.9x faster and matching it within fp8 tolerance.
+    # The ragged indices are compacted (no -1 within a query's segment), so the
+    # mask-free fast path (has_invalid=False) is exact here.
+    _aiter_decode = _aiter_sparse_decode()
+    if _aiter_decode is not None:
+        return _aiter_decode(
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            attn_sink if has_attn_sink else None,
+            scale,
+            extra_cache=extra_cache if has_extra else None,
+            extra_indices=extra_indices if has_extra else None,
+            extra_indptr=extra_indptr if has_extra else None,
+            has_invalid=False,
+        )
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
     # Average per-query segment lengths, read sync-free from the ragged index
@@ -2191,6 +2289,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
         # wrong FNUZ/OCP scale ratio (~1.87×).
         IS_FNUZ_MAIN=is_fnuz,
         IS_FNUZ_EXTRA=False,
+        MAIN_IS_FP8=main_is_fp8,
+        EXTRA_IS_FP8=extra_is_fp8,
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
@@ -2345,8 +2445,8 @@ def rocm_sparse_attn_decode(
     rope_head_dim: int,
     output: torch.Tensor,
 ) -> None:
-    assert swa_k_cache.dtype == torch.uint8, (
-        "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
+    assert swa_k_cache.dtype in (torch.uint8, torch.bfloat16), (
+        "ROCm Triton sparse decode expects a uint8 fp8_ds_mla or bf16 SWA cache, "
         f"got {swa_k_cache.dtype}"
     )
     _validate_dsv4_sparse_dims(
@@ -2365,9 +2465,9 @@ def rocm_sparse_attn_decode(
         assert topk_indices is not None or (
             topk_ragged_indices is not None and topk_ragged_indptr is not None
         )
-        assert kv_cache.dtype == torch.uint8, (
-            "ROCm Triton sparse decode expects uint8 fp8_ds_mla extra cache, "
-            f"got {kv_cache.dtype}"
+        assert kv_cache.dtype in (torch.uint8, torch.bfloat16), (
+            "ROCm Triton sparse decode expects a uint8 fp8_ds_mla or bf16 extra "
+            f"cache, got {kv_cache.dtype}"
         )
         extra_cache = kv_cache
         if topk_indices is not None:
