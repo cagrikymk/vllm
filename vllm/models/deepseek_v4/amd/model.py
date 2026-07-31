@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -59,6 +60,10 @@ from vllm.model_executor.models.utils import (
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
+# DSv4: fuse the dense-MLP clamped-SwiGLU + fp8 quant and run the down-proj
+# through the AITER B-preshuffle GEMM (ROCm). Off by default.
+_USE_AITER_FUSED_MLP_PRESHUFFLE = envs.VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE
 
 
 class DeepseekV4MLP(nn.Module):
@@ -110,6 +115,18 @@ class DeepseekV4MLP(nn.Module):
         # Block scale for the preshuffled gate_up weight; None = not preshuffled.
         self._gateup_scale: torch.Tensor | None = None
 
+        self.swiglu_limit = swiglu_limit
+        # Fused clamped-SwiGLU + fp8-quant -> B-preshuffle down-proj GEMM (ROCm,
+        # aiter). Enabled at load by prepare_fused_act_quant.
+        self._fused_mlp = (
+            _USE_AITER_FUSED_MLP_PRESHUFFLE
+            and swiglu_limit is not None
+            and current_platform.is_rocm()
+            and rocm_aiter_ops.is_enabled()
+        )
+        # Block scale for the preshuffled down_proj weight; None = not preshuffled.
+        self._fused_down_scale: torch.Tensor | None = None
+
     def prepare_gateup_preshuffle(self) -> None:
         # B-preshuffle the gate_up_proj weight in place (single weight).
         if not self._gateup:
@@ -136,8 +153,41 @@ class DeepseekV4MLP(nn.Module):
         )
         self._gateup_scale = ws
 
+    def prepare_fused_act_quant(self) -> None:
+        # B-preshuffle the down_proj weight in place and decode its block scale to
+        # fp32 (the fused act kernel emits an fp32 act scale; the a8w8 GEMM needs
+        # matching dtypes). Once shuffled, the eager act_fn + down_proj path is no
+        # longer valid for this layer.
+        if not self._fused_mlp:
+            return
+        from vllm.model_executor.utils import replace_parameter
+
+        w = getattr(self.down_proj, "weight", None)
+        ws = getattr(self.down_proj, "weight_scale_inv", None)  # per-block scale
+        if w is None or ws is None or w.dim() != 2:
+            return
+        # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
+        if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
+            return
+        if ws.dtype == torch.float8_e8m0fnu:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                _upcast_e8m0_to_fp32,
+            )
+
+            ws = _upcast_e8m0_to_fp32(ws).contiguous()
+        replace_parameter(
+            self.down_proj,
+            "weight",
+            rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+        )
+        self._fused_down_scale = ws
+
     def forward(self, x):
-        if self._gateup_scale is not None and x.dim() == 2:
+        # Both preshuffle paths take 2D activations, and the weights they read are
+        # shuffled in place, so there is no eager fallback to fall back to.
+        if x.dim() != 2:
+            return self.forward(x.flatten(0, -2)).unflatten(0, x.shape[:-1])
+        if self._gateup_scale is not None:
             # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
             x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
             gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
@@ -149,6 +199,24 @@ class DeepseekV4MLP(nn.Module):
             )
         else:
             gate_up, _ = self.gate_up_proj(x)
+        if self._fused_down_scale is not None:
+            assert self.swiglu_limit is not None
+            # Fused clamped-SwiGLU + fp8 quant (column-major scale) -> the
+            # B-preshuffle down-proj GEMM, replacing eager act_fn + down_proj.
+            x_fp8, x_scale = rocm_aiter_ops.fused_clamp_act_mul(
+                gate_up, self.swiglu_limit, group_size=128, transpose_scale=True
+            )
+            out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                x_fp8,
+                self.down_proj.weight,
+                x_scale,
+                self._fused_down_scale,
+                output_dtype=x.dtype,
+            )
+            # down_proj is RowParallel; replicate its all-reduce (we bypass it).
+            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -1013,6 +1081,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
                 module.prepare_attn_preshuffle()
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()
+                module.prepare_fused_act_quant()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

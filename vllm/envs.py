@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
+    VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1189,6 +1190,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+    ),
+    # DSv4: fuse the dense-MLP clamped-SwiGLU + fp8 quant and run the down-proj
+    # through the AITER B-preshuffle GEMM (ROCm). Off by default.
+    "VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE": lambda: (
+        os.getenv("VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE", "False").lower()
+        in ("true", "1")
     ),
     # Use AITER's CustomAllreduce as the custom-allreduce backend inside vLLM's
     # CudaCommunicator on ROCm.
