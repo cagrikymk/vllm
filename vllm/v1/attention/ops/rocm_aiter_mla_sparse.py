@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import importlib
+import inspect
 import math
 from importlib.util import find_spec
 
@@ -1993,6 +1994,46 @@ def _decode_num_splits(
     return best_splits
 
 
+@functools.lru_cache
+def _aiter_pa_decode_sparse():
+    """aiter's gfx950 gluon DSv4 sparse-MLA decode, or None if unavailable.
+
+    Check if the required API for pa_decode_sparse available in aiter.
+    """
+    module_path = "aiter.ops.triton.attention.pa_decode_sparse"
+    if find_spec(module_path) is None:
+        return None
+    try:
+        fn = importlib.import_module(module_path).pa_decode_sparse
+        if "extra_cache" in inspect.signature(fn).parameters:
+            return fn
+    except (
+        ImportError,
+        ModuleNotFoundError,
+        AttributeError,
+        ValueError,
+        TypeError,
+    ):
+        return None
+
+
+def _use_aiter_sparse_decode(
+    q: torch.Tensor,
+    main_cache: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+) -> bool:
+    """Whether aiter's gluon decode can serve this call.
+    Requires GFX950, fp8 cache and bf16 q.
+    """
+    return (
+        _ON_GFX950
+        and not current_platform.is_fp8_fnuz()
+        and q.dtype == torch.bfloat16
+        and main_cache.dtype == torch.uint8
+        and (extra_cache is None or extra_cache.dtype == torch.uint8)
+    )
+
+
 def _rocm_sparse_attn_decode_ragged_triton(
     q: torch.Tensor,
     main_cache: torch.Tensor,
@@ -2061,9 +2102,28 @@ def _rocm_sparse_attn_decode_ragged_triton(
             f"expected extra_indptr shape [{num_queries + 1}], got {extra_indptr.shape}"
         )
     else:
+        # HAS_EXTRA=False compiles out every extra read, so the main segment
+        # stands in as an unread placeholder.
         extra_cache = main_cache
-        extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
-        extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
+        extra_indices = main_indices
+        extra_indptr = main_indptr
+
+    aiter_pa_decode_sparse = _aiter_pa_decode_sparse()
+    if aiter_pa_decode_sparse is not None and _use_aiter_sparse_decode(
+        q, main_cache, extra_cache if has_extra else None
+    ):
+        return aiter_pa_decode_sparse(
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            attn_sink if has_attn_sink else None,
+            scale,
+            has_invalid=True,  # ragged index lists carry -1 sentinels
+            extra_cache=extra_cache if has_extra else None,
+            extra_indices=extra_indices if has_extra else None,
+            extra_indptr=extra_indptr if has_extra else None,
+        )
 
     block_h = 16
     out = torch.empty_like(q, dtype=torch.bfloat16)
