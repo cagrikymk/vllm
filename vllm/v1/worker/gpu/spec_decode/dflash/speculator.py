@@ -152,6 +152,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        if self.query_cudagraph_manager.use_breakable_cg:
+            self.query_cudagraph_manager.init_breakable_cg_runner(self.model)
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,
@@ -257,11 +259,21 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
-            last_hidden_states = self.model(
+            model_inputs = dict(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
                 inputs_embeds=None,
             )
+            if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+                # PIECEWISE cudagraph (compiled PW or breakable), chosen inside
+                # run_pw_graph.
+                assert self.query_cudagraph_manager is not None
+                last_hidden_states = self.query_cudagraph_manager.run_pw_graph(
+                    self.model, model_inputs
+                )
+            else:
+                # Eager (NONE): call the raw model directly.
+                last_hidden_states = self.model(**model_inputs)
         return last_hidden_states
 
     def _generate_draft(
