@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -93,6 +95,20 @@ def fit_kpool_indices_to_aiter(
     output = torch.where(columns < keep_history.unsqueeze(1), history, tail_values)
     valid_output = columns < (keep_history + valid_tail).unsqueeze(1)
     return torch.where(valid_output, output, -1)
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_sparse_mla_supported() -> bool:
+    """Aiter's Gluon gathered-MLA kernel is built and tuned for gfx950 only."""
+    try:
+        from aiter.ops.triton.attention.sparse_mla import (  # noqa: F401
+            sparse_mla_fwd,
+        )
+
+        from vllm.platforms.rocm import on_gfx950
+    except Exception:  # noqa: BLE001
+        return False
+    return on_gfx950()
 
 
 @triton.jit
@@ -807,6 +823,42 @@ class ROCMAiterMLASparseImpl(
         (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
             (q_concat_shape, vllm_config.model_config.dtype),
         )
+        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+
+        # Run the gathered attention on aiter's Gluon kernel instead of _forward_mla.
+        # It takes num_heads < 16 natively, gfx950 only.
+        self.use_gluon_sparse_mla = False
+        if envs.VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA:
+            reason = self._gluon_sparse_mla_unsupported_reason(vllm_config)
+            if reason is not None:
+                logger.warning_once(
+                    "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA=1 requested, but %s; "
+                    "using the _forward_mla instead.",
+                    reason,
+                )
+            else:
+                from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
+
+                self._sparse_mla_fwd = sparse_mla_fwd
+                self.use_gluon_sparse_mla = True
+
+    def _gluon_sparse_mla_unsupported_reason(
+        self, vllm_config: VllmConfig
+    ) -> str | None:
+        """Why the Gluon kernel cannot serve this configuration, or None.
+        Every case here falls back to the _forward_mla
+        """
+        if not _gluon_sparse_mla_supported():
+            return "this device has no Gluon gathered-MLA build (requires gfx950)"
+        cache_dtype = self.kv_cache_dtype
+        if cache_dtype == "auto":
+            cache_dtype = str(vllm_config.model_config.dtype).removeprefix("torch.")
+        if cache_dtype not in ("bfloat16", "fp8", "fp8_e4m3"):
+            return f"kv-cache dtype {cache_dtype!r} is neither bfloat16 nor e4m3 fp8"
+        # Context parallelism merges each rank's partials with a per-token LSE.
+        if self.dcp_world_size > 1 or self.pcp_world_size > 1:
+            return "context parallelism needs an LSE this kernel cannot return"
+        return None
 
     def record_logical_topk_ready(self) -> None:
         # This impl shares the top-k indices buffer via SharedTopkIndicesBuffer
@@ -1017,6 +1069,56 @@ class ROCMAiterMLASparseImpl(
 
         return output, lse
 
+    def _forward_mla_gluon(
+        self,
+        layer: AttentionLayer,
+        q: torch.Tensor,  # [sq, heads, d_qk], not head-padded
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: ROCMAiterMLASparseMetadata,
+    ) -> torch.Tensor:
+        """The same MQA operator as _forward_mla, on aiter's Gluon kernel.
+
+        sparse_mla_fwd follows mla_decode_fwd's calling convention, so the
+        metadata passes straight through. Three things the _forward_mla path needs
+        and this one does not:
+
+        - q head padding: the kernel runs num_heads < 16 natively.
+        - the persistent work-stealing metadata: never read, since the
+          split-K count comes from the shapes.
+        - query length: every query token gets its own entry, so
+          speculative decoding only makes the batch longer.
+
+        Every launch decision comes from shapes and dtypes, with no host
+        reads of device tensors, so this is CUDA-graph capturable.
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        output = torch.empty(
+            [q.shape[0], self.num_heads, self.kv_lora_rank],
+            dtype=attn_metadata.attn_out_dtype,
+            device=q.device,
+        )
+        # fp8 q arrives already quantized with the layer's static scale, and the
+        # cache is fp8 in the same case, so both dots run on the fp8 matrix core
+        # with no dequant.
+        q_is_fp8 = q.dtype == current_platform.fp8_dtype()
+        self._sparse_mla_fwd(
+            q[:num_actual_tokens],
+            # The same flattening rocm_aiter_ops.mla_decode_fwd applies
+            kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+            attn_metadata.paged_kv_indptr,
+            attn_metadata.paged_kv_indices,
+            self.scale,
+            kv_scale=layer._k_scale,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            dot_precision="fp8" if q_is_fp8 else "bf16",
+            q_scale=layer._q_scale if q_is_fp8 else None,
+            # The index stream carries -1 for slots a row does not fill.
+            has_invalid=True,
+            out=output[:num_actual_tokens],
+        )
+        return output
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1068,6 +1170,8 @@ class ROCMAiterMLASparseImpl(
                 original_q_shape = q.shape
                 q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
                 q = q.view(original_q_shape)
+        if self.use_gluon_sparse_mla:
+            return self._forward_mla_gluon(layer, q, kv_c_and_k_pe_cache, attn_metadata)
         mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
         return self._forward_mla(
             layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata
