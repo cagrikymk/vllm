@@ -442,27 +442,11 @@ class CudaGraphManager:
                     forward_fn(CUDAGraphMode.NONE)
 
                     if self.use_breakable_cg:
-                        # Breakable capture runs the attention op EAGERLY
-                        # inside the captured region (breakable_cudagraph.py,
-                        # add_eager), so the collectives inside it really
-                        # execute and every rank has to issue them together.
-                        # The warmup above may JIT a kernel, and how long that
-                        # takes differs per rank, so without a barrier one rank
-                        # can still be in warmup while its peers are already
-                        # capturing: their collective then waits on a
-                        # participant that never arrives, and the straggler
-                        # cannot finish loading its module on a device the
-                        # others are spinning on. Deadlock, with no error.
-                        # Nothing else between the two calls is collective --
-                        # torch.accelerator.synchronize() below is device-local.
-                        # This is a CPU barrier and runs once per descriptor,
-                        # which is free next to the capture it guards. Capture
-                        # happens once at startup, so nothing on the serving
-                        # path is affected.
-                        #
-                        # Skipped at TP=1: there is nobody to synchronise with,
-                        # and this keeps single-GPU startup independent of the
-                        # distributed group being initialised.
+                        # Breakable capture runs attention eagerly,
+                        # so its collectives really execute. Warmup JIT time
+                        # varies per rank, so without this barrier a rank still
+                        # warming up can deadlock peers already capturing.
+                        # Startup-only CPU barrier. Skipped at TP=1.
                         tp_group = get_tp_group()
                         if tp_group.world_size > 1:
                             tp_group.barrier()
