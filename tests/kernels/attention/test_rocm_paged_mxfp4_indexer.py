@@ -197,24 +197,31 @@ def _forward_context(monkeypatch, metadata):
     monkeypatch.setattr(ops, "get_forward_context", lambda: context)
 
 
-def _decode_metadata(case, rows, ratio, query_lens):
+def _decode_metadata(case, rows, ratio, query_lens, next_n, seq_lens=None):
+    seq_lens = case.seq_lens if seq_lens is None else seq_lens
     lens = torch.tensor([(p + 1) // ratio for _, p in rows], dtype=torch.int32)
     lens = lens.to(DEVICE)
     block_table = case.block_table[[req for req, _ in rows]].contiguous()
     entries = case.cache[ratio].shape[1]
-    next_n = max(query_lens)
-    context_lens = (torch.tensor(case.seq_lens, dtype=torch.int32) // ratio).to(DEVICE)
-    native = native_decode(lens, block_table, query_lens, next_n, context_lens)
+    # a padding request keeps next_n rows of its own
+    query_start_loc = torch.tensor(
+        [0, *itertools.accumulate(q or next_n for q in query_lens)],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    context_lens = (torch.tensor(seq_lens, dtype=torch.int32) // ratio).to(DEVICE)
     schedule = torch.empty(
         ops.rocm_mxfp4_decode_schedule_words(HEADS, HEAD_DIM, entries, next_n),
         dtype=torch.int32,
         device=DEVICE,
     )
-    return DeepseekV41RocmMxfp4IndexerMetadata(
+    # as the builder decides: uniform steps native, ragged ones packed
+    native = native_decode(lens, block_table, query_lens, next_n, context_lens)
+    metadata = DeepseekV41RocmMxfp4IndexerMetadata(
         seq_lens=None,
-        max_seq_len=max(case.seq_lens),
+        max_seq_len=max(seq_lens),
         slot_mapping=None,
-        num_decodes=len(case.seq_lens),
+        num_decodes=len(seq_lens),
         num_decode_tokens=len(rows),
         num_prefills=0,
         num_prefill_tokens=0,
@@ -222,10 +229,15 @@ def _decode_metadata(case, rows, ratio, query_lens):
         decode_row_lens=lens,
         decode_block_ends=(lens + CAND_BLOCK - 1) // CAND_BLOCK,
         decode_native=native,
-        decode_schedule=ops.build_rocm_mxfp4_decode_schedule(
-            lens, HEADS, HEAD_DIM, entries, schedule, MAX_LEN // ratio, native
-        ),
+        decode_query_start_loc=None if native else query_start_loc,
+        decode_context_lens=None if native else context_lens,
+        decode_block_table=None if native else case.block_table,
+        decode_next_n=next_n,
     )
+    metadata.decode_schedule = ops.build_rocm_mxfp4_decode_schedule(
+        metadata, HEADS, HEAD_DIM, entries, schedule, MAX_LEN // ratio
+    )
+    return metadata
 
 
 def _prefill_metadata(
@@ -398,8 +410,7 @@ def _run_layers(monkeypatch, case, rows, metadata):
 @pytest.mark.parametrize(
     "query_lens",
     # Uniform steps launch the dense layers on next_n-row sequences, also with
-    # cudagraph padding (query length 0) after them; a ragged step keeps a row
-    # per token.
+    # cudagraph padding (query length 0) after them; a ragged step goes packed.
     [[6, 6, 6, 6], [2, 2, 2], [2, 2, 2, 0], [2, 1, 2]],
     ids=["native6", "native2", "padded", "ragged"],
 )
@@ -416,8 +427,77 @@ def test_decode_layers_match_reference(monkeypatch, block, query_lens):
         monkeypatch,
         case,
         rows,
-        lambda r, gather=False: _decode_metadata(case, rows, r, query_lens),
+        lambda r, gather=False: _decode_metadata(case, rows, r, query_lens, next_n),
     )
+
+
+@BLOCKS
+# A uniform step goes native; a ragged one goes packed, which is also how
+# adaptive verification would replay every step.
+@pytest.mark.parametrize(
+    "query_lens", [[6, 6, 6, 6], [6, 1, 6, 4]], ids=["native", "packed"]
+)
+def test_decode_replays_under_a_cuda_graph(monkeypatch, block, query_lens):
+    """Decode runs under FULL CUDA graphs. A launch captured on one step must
+    replay on the next step's contents once the builder has refilled the same
+    buffers in place: contexts, row bounds, query boundaries and schedule."""
+    next_n, ratio = 6, 2
+    before, after = [900, 333, 610, 1200], [906, 339, 616, 1206]
+    case = _Case(after, block)
+    num_rows = sum(query_lens)
+
+    def step(seq_lens):
+        rows = [
+            (req, n - q + j)
+            for req, (n, q) in enumerate(zip(seq_lens, query_lens))
+            for j in range(q)
+        ]
+        return rows, _decode_metadata(case, rows, ratio, query_lens, next_n, seq_lens)
+
+    rows, md = step(before)
+    context = types.SimpleNamespace(
+        attn_metadata={"indexer": md}, cudagraph_runtime_mode=CUDAGraphMode.FULL
+    )
+    monkeypatch.setattr(ops, "get_forward_context", lambda: context)
+    q, q_scale, weights, _ = _queries(num_rows)
+    hidden = torch.empty(num_rows, 1, device=DEVICE)
+    out = torch.full((num_rows, TOPK), 7, dtype=torch.int32, device=DEVICE)
+
+    def indexer():
+        ops.rocm_mxfp4_sparse_attn_indexer(
+            hidden,
+            "indexer",
+            case.cache[ratio],
+            q,
+            q_scale,
+            weights,
+            TOPK,
+            HEAD_DIM,
+            MAX_LEN // ratio,
+            out,
+            compress_ratio=ratio,
+        )
+
+    indexer()  # compile outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indexer()
+
+    rows, fresh = step(after)
+    for name in ("decode_row_lens", "decode_block_ends"):
+        getattr(md, name).copy_(getattr(fresh, name))
+    if md.decode_native is not None:
+        md.decode_native.context_lens.copy_(fresh.decode_native.context_lens)
+    else:
+        md.decode_context_lens.copy_(fresh.decode_context_lens)
+    md.decode_schedule.copy_(fresh.decode_schedule)
+    new_q, new_scale, new_weights, q_ref = _queries(num_rows)
+    q.copy_(new_q), q_scale.copy_(new_scale), weights.copy_(new_weights)
+    graph.replay()
+    torch.accelerator.synchronize()
+    for i, (req, pos) in enumerate(rows):
+        keys = case.keys(ratio, req, (pos + 1) // ratio)
+        _assert_topk(out[i], _scores(q_ref[i], weights[i], keys), TOPK)
 
 
 @pytest.mark.parametrize(

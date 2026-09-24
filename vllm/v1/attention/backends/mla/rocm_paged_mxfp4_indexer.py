@@ -5,7 +5,7 @@
 Extends the dense indexer metadata with what aiter's paged MXFP4 MQA-logits
 kernel needs to read the cache in place: each prefill chunk as its requests,
 packed through query_start_loc into one launch, the decode rows as next_n-row
-sequences on uniform steps, and, with
+sequences on uniform steps and packed the same way on ragged ones, and, with
 ``AttentionConfig.indexer_sparse_logits``, the per-step state the candidate
 consumers share. Selected for every V4.1 indexer cache when
 ``indexer_kv_dtype="mxfp4"`` on ROCm.
@@ -137,7 +137,17 @@ class DeepseekV41RocmMxfp4IndexerMetadata(DeepseekV32IndexerMetadata):
     """[rows] int32 compressed context of each decode query row."""
     decode_block_ends: torch.Tensor | None = None
     decode_native: RocmMxfp4NativeDecode | None = None
-    """The same rows as next_n-row sequences, for the dense launches."""
+    """The rows as next_n-row sequences on a uniform step; None packs them."""
+    decode_query_start_loc: torch.Tensor | None = None
+    """[decode requests + 1] int32 row offsets of the decode requests, which
+    the packed decode launch finds each row's request from."""
+    decode_context_lens: torch.Tensor | None = None
+    """[decode requests] int32 compressed context of each decode request."""
+    decode_block_table: torch.Tensor | None = None
+    """[decode requests, max_blocks] int32 block table row of each request."""
+    decode_next_n: int = 1
+    """Rows a decode request has when it verifies every draft, which the
+    packed decode launch plans its config for whatever the step's rows."""
     decode_schedule: torch.Tensor | None = None
     """The dense decode launches' work schedule, built once for the step."""
     decode_use_gather: bool = False
@@ -308,9 +318,9 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        # Decode rows are flattened into persistent buffers, and whether a
-        # step launches them as next_n-row sequences depends on its shape
-        # alone (see native_decode).
+        # Every decode tensor lives in a persistent buffer filled on device,
+        # and whether a step launches its rows as next_n-row sequences or
+        # packed depends on its shape alone (see native_decode).
         return AttentionCGSupport.ALWAYS
 
     def __init__(
@@ -332,9 +342,9 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
         self.num_heads, self.head_dim = num_heads, head_dim
         self.page_entries = kv_cache_spec.block_size // self.compress_ratio
         layout = rocm_paged_mxfp4_cache_layout(num_heads, head_dim, self.page_entries)
-        # The consumers' gather and ragged steps take a row per query token.
-        # Uniform steps also launch the dense layers on next_n-row sequences,
-        # see native_decode.
+        # The consumers' gather takes a row per query token. The dense layers
+        # launch uniform steps on next_n-row sequences (see native_decode) and
+        # ragged ones packed, both with the rows' bounds from this flattening.
         self.use_flattening = True
 
         self.candidate_block_size = getattr(hf_config, "candidate_block_size", 0)
@@ -377,9 +387,16 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
         self.context_lens_buffer = torch.zeros(self.arange_buffer.shape[0], **int32)
         spec_config = vllm_config.speculative_config
         # Adaptive verification replays a FULL graph on drafts reallocated
-        # across requests, so a step's shape does not fix its query lengths.
+        # across requests, so a step's shape does not fix its query lengths
+        # and every step goes packed.
         adaptive = spec_config is not None and spec_config.enable_adaptive_verification
         self.native_next_n = 1 if adaptive else self.num_speculative_tokens + 1
+        # A decode request verifies every draft on a full step, which is the
+        # row count the packed launch's config is tuned for: short requests in
+        # a ragged step leave rows of a block idle but read no extra KV.
+        self.decode_next_n = self.num_speculative_tokens + 1
+        self.max_decode_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.decode_block_table_buffer: torch.Tensor | None = None
         # The indexer's logits width, which the decode schedule sizes slices by.
         max_model_len = vllm_config.model_config.max_model_len
         self.logits_width = max_model_len // self.compress_ratio
@@ -388,7 +405,7 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
         # launch costs about half a decode launch.
         self.decode_schedule_buffer = torch.empty(
             rocm_mxfp4_decode_schedule_words(
-                num_heads, head_dim, self.page_entries, self.native_next_n
+                num_heads, head_dim, self.page_entries, self.decode_next_n
             ),
             **int32,
         )
@@ -407,6 +424,26 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
             max_logits_bytes,
             request_offset,
         )
+
+    def _decode_block_table(
+        self, row_block_table: torch.Tensor, first_rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Each decode request's block table row: the flattened table holds it
+        at the request's first row. Cudagraph padding requests start at the end
+        of the rows, so they are clamped onto the last one; they have no
+        context to read it with."""
+        rows, cols = row_block_table.shape
+        num_reqs = first_rows.shape[0]
+        assert num_reqs <= self.max_decode_reqs, (num_reqs, self.max_decode_reqs)
+        buffer = self.decode_block_table_buffer
+        if buffer is None or buffer.shape[1] != cols:
+            buffer = self.decode_block_table_buffer = row_block_table.new_empty(
+                (self.max_decode_reqs, cols)
+            )
+        torch.index_select(
+            row_block_table, 0, first_rows.clamp(max=rows - 1), out=buffer[:num_reqs]
+        )
+        return buffer[:num_reqs]
 
     def _gather_pays(self, context: int, cut: float) -> bool:
         return self.num_candidate_cols > 0 and context >= cut * self.num_candidate_cols
@@ -435,22 +472,30 @@ class DeepseekV41RocmMxfp4IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuild
                 torch.add(lengths, block - 1, out=ends)
                 ends.floor_divide_(block)
                 metadata.decode_block_ends = ends
-            query_start_loc = cm.query_start_loc_cpu[: base.num_decodes + 1]
-            metadata.decode_native = native_decode(
+            num_decodes = base.num_decodes
+            native = native_decode(
                 lengths,
                 base.decode.block_table,
-                torch.diff(query_start_loc).tolist(),
+                torch.diff(cm.query_start_loc_cpu[: num_decodes + 1]).tolist(),
                 self.native_next_n,
                 context_lens,
             )
+            metadata.decode_native = native
+            if native is None:
+                query_start_loc = cm.query_start_loc[: num_decodes + 1]
+                metadata.decode_query_start_loc = query_start_loc
+                metadata.decode_context_lens = context_lens[:num_decodes]
+                metadata.decode_block_table = self._decode_block_table(
+                    base.decode.block_table, query_start_loc[:-1]
+                )
+                metadata.decode_next_n = self.decode_next_n
             metadata.decode_schedule = build_rocm_mxfp4_decode_schedule(
-                lengths,
+                metadata,
                 self.num_heads,
                 self.head_dim,
                 self.page_entries,
                 self.decode_schedule_buffer,
                 self.logits_width,
-                metadata.decode_native,
             )
             metadata.decode_use_gather = self._gather_pays(
                 base.max_seq_len // self.compress_ratio, _GATHER_MIN_CUT_DECODE

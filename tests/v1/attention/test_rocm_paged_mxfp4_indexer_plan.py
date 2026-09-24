@@ -16,6 +16,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerPrefillChunkMetadata,
 )
 from vllm.v1.attention.backends.mla.rocm_paged_mxfp4_indexer import (
+    DeepseekV41RocmMxfp4IndexerMetadataBuilder,
     native_decode,
     plan_gather_launches,
     plan_prefill_chunks,
@@ -186,6 +187,30 @@ def test_decode_launches_native_on_uniform_steps():
     assert native_decode(rows[:5], row_block_table, [2, 1, 2], 2, context_lens) is None
     assert native_decode(rows, row_block_table, [2, 2, 2], 2, context_lens) is None
     assert native_decode(rows[:4], row_block_table, [1] * 4, 1, context_lens) is None
+
+
+def test_decode_block_table_takes_each_requests_first_row():
+    """The packed decode launch reads one block-table row per request, which
+    the flattened table holds at the request's first row. Cudagraph padding
+    requests start past the last row and have no context, so any valid row
+    will do for them."""
+    builder = DeepseekV41RocmMxfp4IndexerMetadataBuilder.__new__(
+        DeepseekV41RocmMxfp4IndexerMetadataBuilder
+    )
+    builder.max_decode_reqs, builder.decode_block_table_buffer = 8, None
+    # requests of 3, 1 and 2 rows, then two padding requests
+    row_table = torch.tensor(
+        [[10, 11], [10, 11], [10, 11], [20, 21], [30, 31], [30, 31]]
+    )
+    first_rows = torch.tensor([0, 3, 4, 6, 6])
+    table = builder._decode_block_table(row_table, first_rows)
+    assert table.tolist() == [[10, 11], [20, 21], [30, 31], [30, 31], [30, 31]]
+    # the next step writes the same buffer, as a replayed graph reads it
+    again = builder._decode_block_table(row_table[3:], torch.tensor([0, 1]))
+    assert again.data_ptr() == table.data_ptr() and again.tolist() == [
+        [20, 21],
+        [30, 31],
+    ]
 
 
 @pytest.mark.parametrize(

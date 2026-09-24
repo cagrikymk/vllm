@@ -40,7 +40,6 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.rocm_paged_mxfp4_indexer import (
         DeepseekV41RocmMxfp4IndexerMetadata,
         RocmMxfp4GatherLaunch,
-        RocmMxfp4NativeDecode,
         RocmMxfp4PrefillPlan,
     )
 
@@ -140,46 +139,50 @@ def rocm_paged_mxfp4_cache_layout(
 def rocm_mxfp4_decode_schedule_words(
     num_heads: int, head_dim: int, page_entries: int, next_n: int = 1
 ) -> int:
-    """int32 words of the largest schedule a decode step can build, flattened or
-    not. The slice cap can take it past target_wgs, up to SCHED_SLOT_CAP."""
-    words = 4 * _aiter().SCHED_SLOT_CAP
-    for rows in {1, next_n}:
-        config = _aiter().select_config(num_heads, head_dim, rows, page_entries)
-        words = max(words, 4 * config["target_wgs"])
-    return words
+    """int32 words of the largest schedule a decode step can build, native or
+    packed: both plan for next_n rows. The slice cap can take it past
+    target_wgs, up to SCHED_SLOT_CAP; aiter raises on a buffer short of it."""
+    config = _aiter().select_config(num_heads, head_dim, next_n, page_entries)
+    return 4 * max(_aiter().SCHED_SLOT_CAP, config["target_wgs"])
 
 
 def build_rocm_mxfp4_decode_schedule(
-    row_lens: torch.Tensor,
+    metadata: "DeepseekV41RocmMxfp4IndexerMetadata",
     num_heads: int,
     head_dim: int,
     page_entries: int,
     out: torch.Tensor,
     logits_width: int,
-    native: "RocmMxfp4NativeDecode | None" = None,
 ) -> torch.Tensor | None:
-    """Work descriptors that even out a decode step, or None where the static
-    grid already fills the machine. Depends only on the rows' lengths, the
-    cache geometry and the logits width, so one serves every layer of a group.
-    The width sizes the slices, capped the way the static grid caps them."""
-    if native is None:
+    """Work descriptors that even out the step's dense decode launch, native or
+    packed, or None where the static grid already fills the machine. Built on
+    device from the requests' contexts, the rows' bounds and, packed, the
+    query boundaries, so one serves every layer of a group. The width sizes the
+    slices, capped the way the static grid caps them."""
+    row_ends = metadata.decode_row_lens
+    assert row_ends is not None
+    native = metadata.decode_native
+    if native is not None:
         return _aiter().build_schedule(
-            row_lens,
-            1,
+            native.context_lens,
+            native.next_n,
             num_heads,
             head_dim,
             page_entries,
             out=out,
+            row_ends=row_ends,
             max_model_len=logits_width,
         )
     return _aiter().build_schedule(
-        native.context_lens,
-        native.next_n,
+        metadata.decode_context_lens,
+        metadata.decode_next_n,
         num_heads,
         head_dim,
         page_entries,
         out=out,
-        row_ends=row_lens,
+        row_ends=row_ends,
+        query_start_loc=metadata.decode_query_start_loc,
+        total_rows=row_ends.shape[0],
         max_model_len=logits_width,
     )
 
@@ -452,18 +455,24 @@ def _dense_decode(layer: _Layer, logits_width: int, candidate_write: bool) -> No
     logits, *scores = current_workspace_manager().get_simultaneous(*specs)
     native = metadata.decode_native
     if native is not None:
-        # A request's next_n rows go in as one sequence, so a workgroup walks
-        # each KV tile once for all of them.
+        # A uniform step: a request's next_n rows go in as one sequence.
         q, q_scale, weights = layer.rows(0, rows, native.context_lens.shape[0])
-        context_lens, block_table, row_ends = (
-            native.context_lens,
-            native.block_table,
-            lengths,
-        )
+        packed: dict = {}
+        context_lens, block_table = native.context_lens, native.block_table
     else:
-        q, q_scale, weights = layer.decode_rows(rows)
-        context_lens, block_table, row_ends = lengths, metadata.decode.block_table, None
-        assert block_table.shape[0] == rows, "one block-table row per query row"
+        # A ragged step goes in packed: the kernel finds each row's request
+        # from query_start_loc, so a request's rows still share its KV tiles.
+        q, q_scale, weights = layer.q[:rows], layer.q_scale[:rows], layer.weights[:rows]
+        packed = dict(
+            query_start_loc=metadata.decode_query_start_loc,
+            next_n=metadata.decode_next_n,
+        )
+        context_lens, block_table = (
+            metadata.decode_context_lens,
+            metadata.decode_block_table,
+        )
+    # Both walk a request's KV tiles once for all its rows; the flattened
+    # layout, a row per sequence, walked them once per row.
     _aiter().paged_mxfp4_mqa_logits(
         q,
         q_scale,
@@ -474,8 +483,9 @@ def _dense_decode(layer: _Layer, logits_width: int, candidate_write: bool) -> No
         logits_width,
         out_logits=logits,
         clean_logits=False,
-        row_ends=row_ends,
+        row_ends=lengths,
         schedule=metadata.decode_schedule,
+        **packed,
         **_block_scores(layer, scores[0] if scores else None),
     )
     candidates = None if layer.candidates is None else layer.candidates[:rows]
