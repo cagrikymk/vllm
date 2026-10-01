@@ -3201,6 +3201,8 @@ class rocm_aiter_ops:
         extra_kv_indptr: torch.Tensor | None = None,
         extra_kv_indices: torch.Tensor | None = None,
         has_invalid: bool = True,
+        extra_kv_scale: torch.Tensor | None = None,
+        dot_precision: str | None = None,
     ) -> None:
         """Sparse MLA read straight from the KV cache, for prefill and decode.
 
@@ -3211,11 +3213,15 @@ class rocm_aiter_ops:
         paged fp8_ds_mla) is inferred from kv_buffer and kv_scale. An fp8 q
         must come with its q_scale and runs both dots in fp8. The extra segment
         is DeepSeek V4's second cache: SWA window in kv_buffer, top-k
-        compressed tokens here.
+        compressed tokens here, with extra_kv_scale for a per-tensor fp8 one.
+        dot_precision defaults to fp8 for an fp8 q, bf16 otherwise.
         """
         from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 
         fp8_q = q.dtype == FP8_DTYPE
+        if dot_precision is None:
+            dot_precision = "fp8" if fp8_q else "bf16"
+        extra_kw = {} if extra_kv_scale is None else {"extra_kv_scale": extra_kv_scale}
         sparse_mla_fwd(
             q,
             kv_buffer,
@@ -3226,13 +3232,14 @@ class rocm_aiter_ops:
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             has_invalid=has_invalid,
-            dot_precision="fp8" if fp8_q else "bf16",
+            dot_precision=dot_precision,
             q_scale=q_scale if fp8_q else None,
             out=o,
             attn_sink=attn_sink,
             extra_kv=extra_kv_buffer,
             extra_indptr=extra_kv_indptr,
             extra_indices=extra_kv_indices,
+            **extra_kw,
         )
 
     @staticmethod

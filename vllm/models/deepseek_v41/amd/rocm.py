@@ -4,10 +4,12 @@
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import torch
 
+from vllm.config import get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -655,6 +657,13 @@ class DeepseekV41RocmMxfp4Indexer(DeepseekV4Indexer):
 
 
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
+    # fp8_e4m3 selects plain per-tensor fp8 KV rows (GLM-5's format) instead
+    # of the UE8M0 block-scaled fp8_ds_mla record; aiter sparse MLA only.
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        *DeepseekV4SparseMLABackend.supported_kv_cache_dtypes,
+        "fp8_e4m3",
+    ]
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_FLASHMLA_SPARSE_DSV4"
@@ -724,6 +733,27 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "are not supported."
                 )
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
+        self._plain_fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
+        if self._plain_fp8_kv:
+            if not self._use_aiter_sparse_mla:
+                raise ValueError(
+                    "--kv-cache-dtype fp8_e4m3 (per-tensor fp8 KV rows) needs the "
+                    "aiter sparse MLA kernel: set "
+                    "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA=1"
+                )
+            # Unit scales, as GLM-5 runs its fp8 cache (layer._q_scale and
+            # _k_scale at 1.0). The names are the ones the shared plain-row
+            # writers read: the SWA insert, the compressor and DSpark.
+            for name, value in (
+                ("_flashinfer_fp8_q_scale", 1.0),
+                ("_flashinfer_fp8_q_scale_inv", 1.0),
+                ("_flashinfer_fp8_kv_scale", 1.0),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.tensor([value], dtype=torch.float32),
+                    persistent=False,
+                )
         if self.compressor is None and self.indexer is None:
             # Dense layers have nothing to overlap; keep the base serial path.
             self.aux_stream_list = None
@@ -731,6 +761,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
+
+    def _uses_fp8_ds_mla_layout(self) -> bool:
+        return get_current_vllm_config().cache_config.cache_dtype != "fp8_e4m3"
 
     def prepare_attn_preshuffle(self) -> None:
         from vllm._aiter_ops import rocm_aiter_ops
@@ -1101,8 +1134,13 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             assert output.shape == q.shape, (
                 f"output buffer shape {output.shape} must match q shape {q.shape}"
             )
-            assert output.dtype == q.dtype, (
-                f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
+            # A per-tensor fp8 cache comes with an fp8 q; the output stays bf16.
+            expected_dtype = (
+                torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+            )
+            assert output.dtype == expected_dtype, (
+                f"output buffer dtype {output.dtype} must be {expected_dtype} "
+                f"for q dtype {q.dtype}"
             )
 
         forward_context = get_forward_context()
@@ -1635,6 +1673,30 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
 
         # Both fp8 caches are read in place: the SWA window as the main segment,
         # the top-k compressed tokens as the extra one.
+        if self._plain_fp8_kv:
+            # Per-tensor fp8 rows with the rope inside the 512-wide row and V
+            # the whole row: aiter's rope-free geometry. The two-loop needs
+            # bf16 dots, so SWA-only layers use them too.
+            kv_scale = self._flashinfer_fp8_kv_scale
+            rocm_aiter_ops.triton_sparse_mla_fwd(
+                q,
+                swa_k_cache,
+                output,
+                self.scale,
+                swa_indptr,
+                swa_indices,
+                kv_lora_rank=self.head_dim,
+                qk_rope_head_dim=0,
+                q_scale=self._flashinfer_fp8_q_scale,
+                kv_scale=kv_scale,
+                attn_sink=self.attn_sink[: q.shape[1]],
+                extra_kv_buffer=compressed_k_cache,
+                extra_kv_indptr=topk_indptr,
+                extra_kv_indices=topk_indices,
+                extra_kv_scale=kv_scale,
+                dot_precision="bf16",
+            )
+            return
         rocm_aiter_ops.triton_sparse_mla_fwd(
             q,
             swa_k_cache,
