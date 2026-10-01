@@ -8,6 +8,7 @@ from typing import Any, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import (
@@ -741,6 +742,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "aiter sparse MLA kernel: set "
                     "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA=1"
                 )
+            logger.info_once(
+                "DeepSeek V4 per-tensor fp8 KV cache: aiter sparse MLA dots in %s",
+                envs.VLLM_ROCM_DSV4_SPARSE_MLA_DOT_PRECISION,
+            )
             # Unit scales, as GLM-5 runs its fp8 cache (layer._q_scale and
             # _k_scale at 1.0). The names are the ones the shared plain-row
             # writers read: the SWA insert, the compressor and DSpark.
@@ -1675,8 +1680,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         # the top-k compressed tokens as the extra one.
         if self._plain_fp8_kv:
             # Per-tensor fp8 rows with the rope inside the 512-wide row and V
-            # the whole row: aiter's rope-free geometry. The two-loop needs
-            # bf16 dots, so SWA-only layers use them too.
+            # the whole row: aiter's rope-free geometry.
             kv_scale = self._flashinfer_fp8_kv_scale
             rocm_aiter_ops.triton_sparse_mla_fwd(
                 q,
@@ -1694,7 +1698,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 extra_kv_indptr=topk_indptr,
                 extra_kv_indices=topk_indices,
                 extra_kv_scale=kv_scale,
-                dot_precision="bf16",
+                dot_precision=envs.VLLM_ROCM_DSV4_SPARSE_MLA_DOT_PRECISION,
             )
             return
         rocm_aiter_ops.triton_sparse_mla_fwd(

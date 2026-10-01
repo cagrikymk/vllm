@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
+    VLLM_ROCM_DSV4_SPARSE_MLA_DOT_PRECISION: Literal["bf16", "fp8"] = "bf16"
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
@@ -1365,6 +1366,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA", "False").lower()
         in ("true", "1")
+    ),
+    # DeepSeek V4 on a per-tensor fp8 KV cache (--kv-cache-dtype fp8_e4m3):
+    # what the aiter sparse MLA's QK and PV matrix-core ops run in. "fp8"
+    # feeds the fp8 cache and q straight to the fp8 MFMA and rounds the
+    # softmax P to e4m3, as GLM-5 runs; "bf16" widens them to bf16.
+    "VLLM_ROCM_DSV4_SPARSE_MLA_DOT_PRECISION": env_with_choices(
+        "VLLM_ROCM_DSV4_SPARSE_MLA_DOT_PRECISION", "bf16", ["bf16", "fp8"]
     ),
     # Whether to use aiter rope.
     # By default is disabled.
