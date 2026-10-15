@@ -120,6 +120,18 @@ def _aiter_sparse_mla_enabled(has_kv_transfer: bool) -> bool:
     return True
 
 
+# aiter's sparse MLA prefill is slower than gather + OPUS at 128 heads per
+# rank, so prefill takes it only up to 64; decode takes it at any head count.
+_AITER_SPARSE_MLA_PREFILL_MAX_HEADS = 64
+
+
+def _aiter_sparse_mla_prefill_enabled(num_heads: int, has_kv_transfer: bool) -> bool:
+    return (
+        _aiter_sparse_mla_enabled(has_kv_transfer)
+        and num_heads <= _AITER_SPARSE_MLA_PREFILL_MAX_HEADS
+    )
+
+
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     lengths = lengths.to(dtype=torch.int32).contiguous()
     indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
@@ -595,8 +607,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
-        self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(
-            self.vllm_config.kv_transfer_config is not None
+        # Only the aiter prefill reads the ragged prefill SWA indices.
+        self._use_aiter_sparse_mla_prefill = _aiter_sparse_mla_prefill_enabled(
+            self.vllm_config.model_config.get_num_attention_heads(
+                self.vllm_config.parallel_config
+            ),
+            self.vllm_config.kv_transfer_config is not None,
         )
 
     def build(
@@ -616,7 +632,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
         prefill_ragged_indices = None
         prefill_ragged_indptr = None
         if (
-            self._use_aiter_sparse_mla
+            self._use_aiter_sparse_mla_prefill
             and base.num_prefill_tokens > 0
             and base.prefill_swa_indices is not None
             and base.prefill_swa_lens is not None
@@ -675,7 +691,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
-    _use_aiter_sparse_mla = False
+    _use_aiter_sparse_mla_decode = False
+    _use_aiter_sparse_mla_prefill = False
 
     def __init__(self, *args, **kwargs):
         vllm_config = args[0] if args else kwargs["vllm_config"]
@@ -701,7 +718,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         else:
             # Disable indexer inner overlap.
             self.indexer.aux_stream = None
-        self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(self._has_kv_transfer)
+        self._use_aiter_sparse_mla_decode = _aiter_sparse_mla_enabled(
+            self._has_kv_transfer
+        )
+        self._use_aiter_sparse_mla_prefill = _aiter_sparse_mla_prefill_enabled(
+            self.n_local_heads, self._has_kv_transfer
+        )
 
     def _run_sequential_pipeline(
         self,
@@ -1250,7 +1272,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             # gather workspace _forward_prefill would; the dequantize / topk
             # / sparse_fwd kernels are skipped this step. The aiter prefill
             # reads the caches in place and never asks for it.
-            if not self._use_aiter_sparse_mla:
+            if not self._use_aiter_sparse_mla_prefill:
                 swa_only = self.compress_ratio <= 1
                 N = (
                     0
@@ -1372,7 +1394,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
-        if self._use_aiter_sparse_mla:
+        if self._use_aiter_sparse_mla_decode:
             assert swa_metadata.decode_swa_ragged_indices is not None
             assert swa_metadata.decode_swa_ragged_indptr is not None
             self._aiter_sparse_mla(
@@ -1427,7 +1449,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
     ) -> None:
-        if self._use_aiter_sparse_mla:
+        if self._use_aiter_sparse_mla_prefill:
             self._forward_prefill_aiter(
                 q=q,
                 compressed_k_cache=compressed_k_cache,
